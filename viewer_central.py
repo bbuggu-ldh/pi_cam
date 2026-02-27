@@ -14,7 +14,8 @@ from flask import Flask, Response, render_template_string, abort
 PI_IPS = ["192.168.0.3", "192.168.0.2", "192.168.0.4"]
 PI_PORT = 8080
 PORT = 8081
-TIMEOUT = 3  # seconds per Pi request
+TIMEOUT = 3   # seconds for image/json requests
+STREAM_TIMEOUT = 10  # seconds socket timeout for live stream proxy
 
 app = Flask(__name__)
 
@@ -60,10 +61,13 @@ HTML = """<!DOCTYPE html>
     }
     .tab.active { background: #2a2a2a; color: #eee; border-bottom-color: #4af; }
     .tab.offline { color: #f66; }
+    .tab.live-tab { color: #4c4; }
+    .tab.live-tab.active { border-bottom-color: #4c4; }
 
     .section { display: none; }
     .section.active { display: block; }
 
+    /* Gallery grid */
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -91,6 +95,38 @@ HTML = """<!DOCTYPE html>
 
     .empty { text-align: center; padding: 80px 20px; color: #555; font-size: 0.9rem; }
     .offline-msg { text-align: center; padding: 80px 20px; color: #f66; font-size: 0.9rem; }
+
+    /* Live grid */
+    .live-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+      gap: 8px; padding: 8px;
+    }
+    .live-card {
+      background: #1a1a1a; border-radius: 6px; overflow: hidden;
+      border: 1px solid #2a2a2a;
+    }
+    .live-card-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 12px; border-bottom: 1px solid #2a2a2a;
+    }
+    .live-card-header .pi-name { font-size: 0.85rem; color: #ccc; }
+    .live-card-header .status {
+      font-size: 0.7rem; padding: 2px 7px; border-radius: 10px;
+    }
+    .status.connecting { background: #2a2a1a; color: #aa8; }
+    .status.live       { background: #1a2a1a; color: #4c4; }
+    .status.reconnect  { background: #2a1a1a; color: #f66; }
+    .status.offline    { background: #2a1a1a; color: #f66; }
+    .live-card img {
+      width: 100%; display: block;
+      background: #000; aspect-ratio: 16/9; object-fit: contain;
+    }
+    .live-card .offline-stream {
+      aspect-ratio: 16/9; display: flex;
+      align-items: center; justify-content: center;
+      color: #f66; font-size: 0.85rem;
+    }
 
     /* Lightbox */
     #lb {
@@ -141,30 +177,28 @@ HTML = """<!DOCTYPE html>
 
 <script>
 const pis = {{ pis_json }};
+const LIVE_IDX = pis.length + 1;
 
 let lbItems = [], lbIdx = 0;
 
 // ── Build UI ──────────────────────────────────────────────────────────────────
 
 function buildUI() {
-  const tabsEl    = document.getElementById('tabs');
+  const tabsEl     = document.getElementById('tabs');
   const sectionsEl = document.getElementById('sections');
 
-  // Collect all images across all online Pis for the "All" tab
   const allItems = [];
   pis.forEach((pi, piIdx) => {
-    if (pi.online && pi.images) {
+    if (pi.online && pi.images)
       pi.images.forEach(img => allItems.push({ img, piIdx, badge: true }));
-    }
   });
 
-  addTab(tabsEl, 'All (' + allItems.length + ')', 0, false);
+  addTab(tabsEl, 'All (' + allItems.length + ')', 0, '');
   addSection(sectionsEl, allItems, 0);
 
   pis.forEach((pi, piIdx) => {
     const label = (pi.hostname || pi.ip) + (pi.online ? '' : ' (offline)');
-    addTab(tabsEl, label, piIdx + 1, !pi.online);
-
+    addTab(tabsEl, label, piIdx + 1, pi.online ? '' : 'offline');
     if (!pi.online) {
       addOfflineSection(sectionsEl, piIdx + 1, pi.ip);
     } else {
@@ -173,12 +207,15 @@ function buildUI() {
     }
   });
 
+  addTab(tabsEl, '▶ Live', LIVE_IDX, 'live-tab');
+  addLiveSection(sectionsEl);
+
   activateTab(0);
 }
 
-function addTab(container, label, idx, isOffline) {
+function addTab(container, label, idx, extraClass) {
   const btn = document.createElement('button');
-  btn.className = 'tab' + (isOffline ? ' offline' : '');
+  btn.className = 'tab' + (extraClass ? ' ' + extraClass : '');
   btn.textContent = label;
   btn.dataset.idx = idx;
   btn.onclick = () => activateTab(idx);
@@ -204,7 +241,6 @@ function addSection(container, items, idx) {
   items.forEach(({ img, piIdx, badge }) => {
     const cardIdx = sectionItems.length;
     sectionItems.push({ img, piIdx });
-
     const card = document.createElement('div');
     card.className = 'card';
     card.innerHTML =
@@ -229,25 +265,107 @@ function addOfflineSection(container, idx, ip) {
   container.appendChild(div);
 }
 
+// ── Live section ──────────────────────────────────────────────────────────────
+
+const _streamTimers = {};
+
+function addLiveSection(container) {
+  const div = document.createElement('div');
+  div.className = 'section';
+  div.dataset.idx = LIVE_IDX;
+  div._items = [];
+
+  const grid = document.createElement('div');
+  grid.className = 'live-grid';
+
+  pis.forEach((pi, piIdx) => {
+    const name = pi.hostname || pi.ip;
+    const card = document.createElement('div');
+    card.className = 'live-card';
+
+    if (!pi.online) {
+      card.innerHTML =
+        `<div class="live-card-header">` +
+          `<span class="pi-name">${name}</span>` +
+          `<span class="status offline">offline</span>` +
+        `</div>` +
+        `<div class="offline-stream">Camera unreachable</div>`;
+    } else {
+      card.innerHTML =
+        `<div class="live-card-header">` +
+          `<span class="pi-name">${name}</span>` +
+          `<span class="status connecting" id="status-${piIdx}">connecting…</span>` +
+        `</div>` +
+        `<img id="stream-${piIdx}" data-pi="${piIdx}" alt="${name}">`;
+    }
+    grid.appendChild(card);
+  });
+
+  div.appendChild(grid);
+  container.appendChild(div);
+}
+
+function startStreams() {
+  pis.forEach((pi, piIdx) => {
+    if (!pi.online) return;
+    const img = document.getElementById('stream-' + piIdx);
+    if (img && !img._streaming) loadStream(img, piIdx);
+  });
+}
+
+function stopStreams() {
+  pis.forEach((_, piIdx) => {
+    clearTimeout(_streamTimers[piIdx]);
+    const img = document.getElementById('stream-' + piIdx);
+    if (img) { img._streaming = false; img.src = ''; }
+    setStatus(piIdx, 'connecting', 'connecting…');
+  });
+}
+
+function loadStream(img, piIdx) {
+  img._streaming = true;
+  img.src = '/stream/' + piIdx + '?t=' + Date.now();
+  setStatus(piIdx, 'live', 'live');
+
+  img.onerror = () => {
+    setStatus(piIdx, 'reconnect', 'reconnecting…');
+    _streamTimers[piIdx] = setTimeout(() => {
+      if (img._streaming) loadStream(img, piIdx);
+    }, 3000);
+  };
+  img.onload = () => setStatus(piIdx, 'live', 'live');
+}
+
+function setStatus(piIdx, cls, text) {
+  const el = document.getElementById('status-' + piIdx);
+  if (el) { el.className = 'status ' + cls; el.textContent = text; }
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+
 function activateTab(idx) {
   document.querySelectorAll('.tab').forEach(t =>
     t.classList.toggle('active', +t.dataset.idx === idx));
   document.querySelectorAll('.section').forEach(s =>
     s.classList.toggle('active', +s.dataset.idx === idx));
 
-  const sec = document.querySelector('.section.active');
-  const cnt = sec?._items?.length ?? 0;
-  document.getElementById('count-label').textContent =
-    idx === 0
-      ? pis.reduce((s, p) => s + (p.images ? p.images.length : 0), 0) + ' total'
-      : (pis[idx - 1].online ? cnt + ' image' + (cnt !== 1 ? 's' : '') : 'offline');
+  if (idx === LIVE_IDX) {
+    startStreams();
+  } else {
+    stopStreams();
+    const sec = document.querySelector('.section.active');
+    const cnt = sec?._items?.length ?? 0;
+    document.getElementById('count-label').textContent =
+      idx === 0
+        ? pis.reduce((s, p) => s + (p.images ? p.images.length : 0), 0) + ' total'
+        : (pis[idx - 1].online ? cnt + ' image' + (cnt !== 1 ? 's' : '') : 'offline');
+  }
 }
 
 // ── Lightbox ──────────────────────────────────────────────────────────────────
 
 function openLb(items, idx) {
-  lbItems = items;
-  lbIdx   = idx;
+  lbItems = items; lbIdx = idx;
   renderLb();
   document.getElementById('lb').classList.add('open');
 }
@@ -268,9 +386,9 @@ function lbStep(dir) {
 
 document.getElementById('lb').addEventListener('click', e => { if (e.target === e.currentTarget) closeLb(); });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape')      closeLb();
-  if (e.key === 'ArrowRight')  lbStep(1);
-  if (e.key === 'ArrowLeft')   lbStep(-1);
+  if (e.key === 'Escape')     closeLb();
+  if (e.key === 'ArrowRight') lbStep(1);
+  if (e.key === 'ArrowLeft')  lbStep(-1);
 });
 
 // ── Auto-refresh ──────────────────────────────────────────────────────────────
@@ -320,7 +438,32 @@ def proxy_image(pi_idx, filename):
         abort(502)
 
 
+@app.route("/stream/<int:pi_idx>")
+def proxy_stream(pi_idx):
+    if pi_idx < 0 or pi_idx >= len(PI_IPS):
+        abort(400)
+    ip = PI_IPS[pi_idx]
+    url = f"http://{ip}:{PI_PORT}/stream"
+
+    def generate():
+        try:
+            with urllib.request.urlopen(url, timeout=STREAM_TIMEOUT) as r:
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    yield chunk
+        except Exception:
+            pass
+
+    return Response(
+        generate(),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+        headers={'Cache-Control': 'no-cache'},
+    )
+
+
 if __name__ == "__main__":
     print(f"Starting central viewer at http://localhost:{PORT}")
     print(f"Fetching from Pis: {', '.join(PI_IPS)}")
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

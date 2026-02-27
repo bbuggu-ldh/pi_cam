@@ -29,6 +29,28 @@ JPEG_QUALITY = 95         # rpicam-jpeg -q value (0-100)
 # ===== Web Viewer =====
 WEB_VIEWER_ENABLED = True
 WEB_PORT = 8080
+STREAM_WIDTH  = 1280      # live stream resolution (lower = less CPU/bandwidth)
+STREAM_HEIGHT = 720
+STREAM_FPS    = 15
+
+
+# ── Camera management ─────────────────────────────────────────────────────────
+
+_stream_proc = None
+_stream_lock = threading.Lock()
+
+
+def _kill_stream():
+    """Terminate the live stream process so the camera is free for still capture."""
+    global _stream_proc
+    with _stream_lock:
+        if _stream_proc and _stream_proc.poll() is None:
+            _stream_proc.terminate()
+            try:
+                _stream_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                _stream_proc.kill()
+            _stream_proc = None
 
 
 # ── Capture helpers ───────────────────────────────────────────────────────────
@@ -89,6 +111,7 @@ def send_ack(to_ip: str, ok: bool, info: str):
 
 
 def capture_jpeg(filename: str):
+    _kill_stream()  # free the camera before still capture
     cmd = [
         "rpicam-jpeg",
         "-o", filename,
@@ -124,6 +147,13 @@ _WEB_HTML = """<!DOCTYPE html>
     .auto-refresh { display: flex; align-items: center; gap: 8px; font-size: 0.8rem; color: #aaa; }
     .auto-refresh input { accent-color: #4af; }
 
+    .live-btn {
+      padding: 5px 12px; font-size: 0.8rem; background: #1e3a4a;
+      color: #4af; border: 1px solid #2a5a7a; border-radius: 4px;
+      cursor: pointer; text-decoration: none;
+    }
+    .live-btn:hover { background: #254a60; }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
@@ -148,17 +178,34 @@ _WEB_HTML = """<!DOCTYPE html>
 
     .empty { text-align: center; padding: 80px 20px; color: #555; }
 
+    /* Live overlay */
+    #live-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.95); z-index: 100;
+      flex-direction: column; align-items: center; justify-content: center;
+    }
+    #live-overlay.open { display: flex; }
+    #live-overlay img {
+      max-width: 95vw; max-height: 88vh; object-fit: contain;
+      background: #000;
+    }
+    #live-overlay .lo-label {
+      margin-top: 10px; font-size: 0.8rem; color: #4af;
+    }
+    #live-close {
+      position: absolute; top: 14px; right: 18px;
+      font-size: 1.6rem; cursor: pointer; color: #aaa; background: none; border: none;
+    }
+
     /* Lightbox */
     #lb {
       display: none; position: fixed; inset: 0;
-      background: rgba(0,0,0,0.92); z-index: 100;
+      background: rgba(0,0,0,0.92); z-index: 200;
       align-items: center; justify-content: center; flex-direction: column;
     }
     #lb.open { display: flex; }
     #lb img { max-width: 95vw; max-height: 90vh; object-fit: contain; }
-    #lb .lb-name {
-      margin-top: 10px; font-size: 0.8rem; color: #888;
-    }
+    #lb .lb-name { margin-top: 10px; font-size: 0.8rem; color: #888; }
     #lb-close {
       position: absolute; top: 14px; right: 18px;
       font-size: 1.6rem; cursor: pointer; color: #aaa; background: none; border: none;
@@ -169,8 +216,9 @@ _WEB_HTML = """<!DOCTYPE html>
 
 <header>
   <h1>Pi Cam &mdash; {{ hostname }}</h1>
-  <div style="display:flex; gap:20px; align-items:center;">
+  <div style="display:flex; gap:14px; align-items:center;">
     <span>{{ count }} image{{ 's' if count != 1 else '' }}</span>
+    <a class="live-btn" onclick="openLive()">&#9654; Live</a>
     <label class="auto-refresh">
       <input type="checkbox" id="ar"> Auto-refresh
     </label>
@@ -190,6 +238,14 @@ _WEB_HTML = """<!DOCTYPE html>
 <div class="empty">No images yet in {{ save_dir }}</div>
 {% endif %}
 
+<!-- Live stream overlay -->
+<div id="live-overlay">
+  <button id="live-close" onclick="closeLive()">&#x2715;</button>
+  <img id="live-img" src="" alt="live stream">
+  <div class="lo-label">Live &mdash; {{ hostname }}</div>
+</div>
+
+<!-- Lightbox -->
 <div id="lb">
   <button id="lb-close" onclick="closeLb()">&#x2715;</button>
   <img id="lb-img" src="" alt="">
@@ -197,6 +253,25 @@ _WEB_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+  // Live stream
+  let liveTimer = null;
+  function openLive() {
+    const img = document.getElementById('live-img');
+    loadStream(img);
+    document.getElementById('live-overlay').classList.add('open');
+  }
+  function closeLive() {
+    document.getElementById('live-overlay').classList.remove('open');
+    const img = document.getElementById('live-img');
+    img.src = '';
+    clearTimeout(liveTimer);
+  }
+  function loadStream(img) {
+    img.src = '/stream?t=' + Date.now();
+    img.onerror = () => { liveTimer = setTimeout(() => loadStream(img), 3000); };
+  }
+
+  // Lightbox
   function openLb(name) {
     document.getElementById('lb-img').src = '/img/' + name;
     document.getElementById('lb-name').textContent = name;
@@ -210,9 +285,10 @@ _WEB_HTML = """<!DOCTYPE html>
     if (e.target === this) closeLb();
   });
   document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape') closeLb();
+    if (e.key === 'Escape') { closeLb(); closeLive(); }
   });
 
+  // Auto-refresh
   let arTimer = null;
   document.getElementById('ar').addEventListener('change', function() {
     if (this.checked) arTimer = setInterval(() => location.reload(), 3000);
@@ -223,9 +299,31 @@ _WEB_HTML = """<!DOCTYPE html>
 </html>"""
 
 
+def _mjpeg_frames(proc):
+    """Parse raw MJPEG stdout into individual JPEG frames."""
+    buf = b""
+    while True:
+        chunk = proc.stdout.read(65536)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            start = buf.find(b'\xff\xd8')
+            if start == -1:
+                buf = b""
+                break
+            end = buf.find(b'\xff\xd9', start + 2)
+            if end == -1:
+                if start > 0:
+                    buf = buf[start:]
+                break
+            yield buf[start:end + 2]
+            buf = buf[end + 2:]
+
+
 def _start_web_viewer():
     try:
-        from flask import Flask, abort, jsonify, render_template_string, send_file
+        from flask import Flask, abort, jsonify, render_template_string, send_file, Response
     except ImportError:
         print("[viewer] Flask not installed — web viewer disabled.")
         return
@@ -266,6 +364,48 @@ def _start_web_viewer():
         if not os.path.isfile(path):
             abort(404)
         return send_file(path, mimetype="image/jpeg")
+
+    @web.route("/stream")
+    def stream():
+        global _stream_proc
+
+        def generate():
+            global _stream_proc
+            _kill_stream()
+            cmd = [
+                "rpicam-vid",
+                "-t", "0",
+                "--codec", "mjpeg",
+                "--width",     str(STREAM_WIDTH),
+                "--height",    str(STREAM_HEIGHT),
+                "--framerate", str(STREAM_FPS),
+                "--nopreview",
+                "-o", "-",
+            ]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            with _stream_lock:
+                _stream_proc = proc
+            try:
+                for frame in _mjpeg_frames(proc):
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                           + frame + b'\r\n')
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                with _stream_lock:
+                    if _stream_proc is proc:
+                        _stream_proc = None
+
+        return Response(
+            generate(),
+            mimetype='multipart/x-mixed-replace; boundary=frame',
+            headers={'Cache-Control': 'no-cache'},
+        )
 
     print(f"[viewer] Starting on http://0.0.0.0:{WEB_PORT}")
     web.run(host="0.0.0.0", port=WEB_PORT, debug=False, use_reloader=False)
